@@ -29,7 +29,7 @@ const {
     SPL_ACCOUNT_LAYOUT
 } = require("@raydium-io/raydium-sdk");
 
-const JITO_TIMEOUT = 90000;
+const JITO_TIMEOUT = 60000;
 
 async function getWalletTokenAccount(connection, wallet) {
     const walletTokenAccount = await connection.getTokenAccountsByOwner(wallet, {
@@ -86,9 +86,7 @@ async function buildBuyTransaction(connection, buyerOrSeller, token, poolInfo, s
     return txns
 }
 
-
-async function buildSellTransaction(connection, buyerOrSeller, token, poolInfo, solAmount) {
-    let tokenAccountInfo = null;
+async function buildSellTransaction(connection, buyerOrSeller, token, poolInfo, percent) {
     try {
         const associatedToken = getAssociatedTokenAddressSync(
             token.address,
@@ -99,19 +97,21 @@ async function buildSellTransaction(connection, buyerOrSeller, token, poolInfo, 
             token.address,
             token.decimals
         );
-        tokenAccountInfo = await getAccount(connection, associatedToken);
+        const tokenAccountInfo = await getAccount(connection, associatedToken);
         const zero = new BN(0);
         const tokenBalance = new BN(tokenAccountInfo.amount);
-        if (tokenBalance.lte(zero)) return
-        let walletTokenAccount = null;
-        walletTokenAccount = await getWalletTokenAccount(
+        if (tokenBalance.lte(zero)) {
+            console.log('No token balance.');
+            return
+        }
+        const tenPercent = tokenBalance.muln(parseInt(percent) / 100);
+        const walletTokenAccount = await getWalletTokenAccount(
             connection,
             buyerOrSeller.publicKey
         );
-        const tokenAmount = new BigNumber(tokenAccountInfo.amount.toString());
         const baseAmount = new TokenAmount(
             baseToken,
-            new BN(tokenAmount.toFixed(0))
+            tenPercent
         );
         const quoteToken = new Token(
             TOKEN_PROGRAM_ID,
@@ -142,9 +142,82 @@ async function buildSellTransaction(connection, buyerOrSeller, token, poolInfo, 
             innerTransactions: innerTransactions,
         });
         return txns
-    } catch (err) {
+    } catch (error) {
+        console.log('error :>> ', error);
         return
     }
+}
+
+async function sendBundleConfirmTxId(
+    transaction,
+    txHashs,
+    connection
+) {
+    try {
+        if (transaction.length === 0) return false;
+
+        console.log("Sending bundles...", transaction.length);
+        let bundleIds = [];
+        prev_Balance = [];
+        const jito_endpoint = "https://ny.mainnet.block-engine.jito.wtf";
+        for (let i = 0; i < transaction.length; i++) {
+            const rawTransactions = transaction[i].map((item) =>
+                bs58.encode(item.serialize())
+            );
+            const { data } = await axios.post(
+                jito_endpoint + "/api/v1/bundles",
+                {
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "sendBundle",
+                    params: [rawTransactions],
+                },
+                {
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                }
+            );
+            if (data) {
+                console.log(data);
+                bundleIds = [...bundleIds, data.result];
+            }
+        }
+
+        console.log("Checking bundle's status...", bundleIds);
+        const sentTime = Date.now();
+        while (Date.now() - sentTime < JITO_TIMEOUT) {
+            try {
+                let success = true;
+                for (let i = 0; i < bundleIds.length; i++) {
+                    let txResult = await connection.getTransaction(txHashs[i], {
+                        commitment: 'confirmed', 
+                        preflightCommitment: 'confirmed', 
+                        maxSupportedTransactionVersion: 1
+                    });
+
+                    if (txResult === null) {
+                        success = false;
+                        break;
+                    } else {
+                        console.log("checked", bundleIds[i]);
+                    }
+                }
+
+                if (success) {
+                    console.log("Success sendBundleConfirmTxId");
+                    return true;
+                }
+            } catch (err) {
+                console.log(err);
+            }
+
+            await sleep(100);
+        }
+    } catch (err) {
+        console.log(err);
+    }
+    return false;
 }
 
 async function sendBundleWithAddress(
@@ -269,7 +342,6 @@ function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
 }
 
-
 async function getPoolInfo(connection, token) {
     console.log("Getting pool info...", token);
 
@@ -284,7 +356,7 @@ async function getPoolInfo(connection, token) {
     const baseToken = new Token(TOKEN_PROGRAM_ID, token, mintInfo.decimals);
     const quoteToken = new Token(TOKEN_PROGRAM_ID, "So11111111111111111111111111111111111111112", 9, "WSOL", "WSOL");
 
-    const PROGRAMIDS = process.env.DEVNET_MODE === "true" ? DEVNET_PROGRAM_ID : MAINNET_PROGRAM_ID;
+    const PROGRAMIDS = MAINNET_PROGRAM_ID;
     const marketAccounts = await Market.findAccountsByMints(connection, baseToken.mint, quoteToken.mint, PROGRAMIDS.OPENBOOK_MARKET);
     if (marketAccounts.length === 0) {
         console.log("Not found market info");
@@ -317,6 +389,7 @@ async function getPoolInfo(connection, token) {
 
 module.exports = {
     sendBundleWithAddress,
+    sendBundleConfirmTxId,
     buildBuyTransaction,
     buildSellTransaction,
     getTipTransaction,
